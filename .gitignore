@@ -69,3 +69,5 @@ isaac-gym-preview*
 isaacgym
 
 *.swp
+
+!deploy/iceoryx/**
