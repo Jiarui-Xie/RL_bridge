@@ -65,10 +65,12 @@ class SiriusJoyFlat(BaseTask):
         self.cfg = cfg
         self.sim_params = sim_params
         self.height_samples = None
-        self.debug_viz = False
+        self.debug_viz = True
         self.init_done = False
         self._parse_cfg(self.cfg)
+        print(f"DEBUG: cfg.env.num_envs = {cfg.env.num_envs}")
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
+        print(f"DEBUG: After super().__init__, self.num_envs = {self.num_envs}")
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
@@ -139,6 +141,7 @@ class SiriusJoyFlat(BaseTask):
         """ Check if environments need to be reset
         """
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        self.reset_buf |= self.root_states[:, 2] < 1.0  # Terminate if height < 1m
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
 
@@ -209,12 +212,16 @@ class SiriusJoyFlat(BaseTask):
     def compute_observations(self):
         """ Computes observations
         """
+        # Get front two pillars' top corners (8 corners total, 16 values: x,z coordinates)
+        pillar_corners = self._get_front_pillar_corners()  # shape: (num_envs, 16)
+        
         self.obs_buf = torch.cat((  self.base_ang_vel  * self.obs_scales.ang_vel, # 3dim
                                     self.projected_gravity, # 3dim
                                     self.commands[:, :3] * self.commands_scale, # 3dim
                                     (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos, # 12dim
                                     self.dof_vel * self.obs_scales.dof_vel, # 12dim
-                                    self.actions # 12dim
+                                    self.actions, # 12dim
+                                    pillar_corners # 16dim (8 corners * 2 coordinates)
                                     ),dim=-1)
         
         # add perceptive inputs if not blind
@@ -235,12 +242,14 @@ class SiriusJoyFlat(BaseTask):
             self.terrain = Terrain(self.cfg.terrain, self.num_envs)
         if mesh_type=='plane':
             self._create_ground_plane()
+        elif mesh_type=='bridge':
+            self._create_ground_bridge()
         elif mesh_type=='heightfield':
             self._create_heightfield()
         elif mesh_type=='trimesh':
             self._create_trimesh()
         elif mesh_type is not None:
-            raise ValueError("Terrain mesh type not recognised. Allowed types are [None, plane, heightfield, trimesh]")
+            raise ValueError("Terrain mesh type not recognised. Allowed types are [None, plane, bridge, heightfield, trimesh]")
         self._create_envs()
 
     def set_camera(self, position, lookat):
@@ -419,26 +428,31 @@ class SiriusJoyFlat(BaseTask):
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
     def _update_terrain_curriculum(self, env_ids):
-        """ Implements the game-inspired curriculum.
-
-        Args:
-            env_ids (List[int]): ids of environments being reset
-        """
-        # Implement Terrain curriculum
+        """ Update pillar difficulty based on performance """
         if not self.init_done:
-            # don't change on initial reset
             return
-        distance = torch.norm(self.root_states[env_ids, :2] - self.env_origins[env_ids, :2], dim=1)
-        # robots that walked far enough progress to harder terains
-        move_up = distance > self.terrain.env_length / 2
-        # robots that walked less than half of their required distance go to simpler terrains
-        move_down = (distance < torch.norm(self.commands[env_ids, :2], dim=1)*self.max_episode_length_s*0.5) * ~move_up
-        self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
-        # Robots that solve the last level are sent to a random one
-        self.terrain_levels[env_ids] = torch.where(self.terrain_levels[env_ids]>=self.max_terrain_level,
-                                                   torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
-                                                   torch.clip(self.terrain_levels[env_ids], 0)) # (the minumum level is zero)
-        self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
+        
+        # Check if robot made good progress (reached far enough)
+        distance = self.root_states[env_ids, 0] - self.env_origins[env_ids, 0]
+        
+        # Increase difficulty if robot traveled > 2m
+        move_up = distance > 2.0
+        # Decrease difficulty if robot failed quickly (< 1m)
+        move_down = (distance < 1.0) * ~move_up
+        
+        # Update difficulty (0.0 to 1.0)
+        self.pillar_difficulty[env_ids] += 0.1 * move_up.float() - 0.05 * move_down.float()
+        self.pillar_difficulty[env_ids] = torch.clip(self.pillar_difficulty[env_ids], 0.0, 1.0)
+        
+        # Regenerate pillars for these environments
+        # Note: This only updates the layout data, actual mesh is static
+        for env_id in env_ids:
+            difficulty = self.pillar_difficulty[env_id].item()
+            self.env_pillar_layouts[env_id] = self._generate_pillar_layout(difficulty)
+            
+            # Update visualization corners if it's env 0
+            if env_id == 0:
+                self._update_pillar_corners(0)
     
     def update_command_curriculum(self, env_ids):
         """ Implements a curriculum of increasing commands
@@ -473,8 +487,9 @@ class SiriusJoyFlat(BaseTask):
         noise_vec[9:21] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
         noise_vec[21:33] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
         noise_vec[33:45] = 0. # previous actions
+        noise_vec[45:61] = 0.05 * noise_level  # pillar corners (16 values)
         if self.cfg.terrain.measure_heights:
-            noise_vec[48:235] = noise_scales.height_measurements* noise_level * self.obs_scales.height_measurements
+            noise_vec[61:] = noise_scales.height_measurements* noise_level * self.obs_scales.height_measurements
         return noise_vec
 
     #----------------------------------------
@@ -513,11 +528,14 @@ class SiriusJoyFlat(BaseTask):
         self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
         self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
         self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
-        self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
-        self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
-        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
-        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
-        self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+        # Initialize with placeholder - will be resized after feet_indices is created
+        # Use a temporary size of 4 feet (typical for quadruped)
+        self.feet_air_time = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_contacts = torch.zeros(self.num_envs, 4, dtype=torch.bool, device=self.device, requires_grad=False)
+        # Initialize these tensors but don't compute values yet (will be computed in post_physics_step)
+        self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.projected_gravity = torch.zeros_like(self.gravity_vec)
         if self.cfg.terrain.measure_heights:
             self.height_points = self._init_height_points()
         self.measured_heights = 0
@@ -575,6 +593,51 @@ class SiriusJoyFlat(BaseTask):
         plane_params.dynamic_friction = self.cfg.terrain.dynamic_friction
         plane_params.restitution = self.cfg.terrain.restitution
         self.gym.add_ground(self.sim, plane_params)
+        
+    def _create_ground_bridge(self):
+        """ Creates bridge environment - only ground plane and pillar data """
+        # Create ground plane
+        self._create_ground_plane()
+        
+        # Initialize pillar data (will be used later in _create_envs)
+        self._init_pillar_data()
+        
+    def _init_pillar_data(self):
+        """ Initialize pillar positions - will be regenerated per environment """
+        self.pillar_top_corners = []
+        # Initialize curriculum difficulty levels per environment
+        self.pillar_difficulty = torch.zeros(self.num_envs, device=self.device)
+        print(f"Initialized pillar curriculum system")
+    
+    def _generate_pillar_layout(self, difficulty=0.0):
+        """ Generate pillar positions based on difficulty level (0.0 to 1.0) """
+        pillar_positions = []
+        
+        # Interpolate gap range based on difficulty
+        min_gap, max_gap = self.cfg.terrain.pillar_gap_range
+        gap_range = min_gap + difficulty * (max_gap - min_gap)
+        
+        # Start pillar
+        start_pos = [0.0, 0.0, 0.5]
+        pillar_positions.append(('start', start_pos))
+        
+        current_x = 0.5
+        
+        # Middle pillars with difficulty-based gaps
+        for i in range(10):
+            gap = round(np.random.uniform(min_gap, gap_range), 3)
+            current_x += gap
+            middle_pos = [round(current_x + 0.125, 3), 0.0, 0.5]
+            pillar_positions.append(('middle', middle_pos))
+            current_x += 0.25
+        
+        # End pillar
+        final_gap = round(np.random.uniform(min_gap, gap_range), 3)
+        current_x += final_gap
+        end_pos = [round(current_x + 0.5, 3), 0.0, 0.5]
+        pillar_positions.append(('end', end_pos))
+        
+        return pillar_positions
     
     def _create_heightfield(self):
         """ Adds a heightfield terrain to the simulation, sets parameters based on the cfg.
@@ -668,6 +731,7 @@ class SiriusJoyFlat(BaseTask):
         env_upper = gymapi.Vec3(0., 0., 0.)
         self.actor_handles = []
         self.envs = []
+        print(f"DEBUG: Creating {self.num_envs} environments...")
         for i in range(self.num_envs):
             # create env instance
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
@@ -685,10 +749,18 @@ class SiriusJoyFlat(BaseTask):
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
+        
+        # Create bridge pillars if bridge terrain is used
+        if hasattr(self, 'pillar_difficulty'):
+            self._create_bridge_pillars()
 
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(feet_names)):
             self.feet_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], feet_names[i])
+        
+        # Initialize feet-related tensors now that feet_indices is created
+        self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
 
         self.penalised_contact_indices = torch.zeros(len(penalized_contact_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(penalized_contact_names)):
@@ -697,6 +769,104 @@ class SiriusJoyFlat(BaseTask):
         self.termination_contact_indices = torch.zeros(len(termination_contact_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(termination_contact_names)):
             self.termination_contact_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], termination_contact_names[i])
+    
+    def _create_bridge_pillars(self):
+        """ Create bridge pillars for each environment with curriculum """
+        print(f"Creating bridge pillars for {self.num_envs} environments...")
+        
+        vertices = []
+        faces = []
+        vertex_count = 0
+        
+        # Store pillar layouts for each environment
+        self.env_pillar_layouts = []
+        
+        # Create pillars for each environment
+        for env_id in range(self.num_envs):
+            env_origin = self.env_origins[env_id].cpu().numpy()
+            difficulty = self.pillar_difficulty[env_id].item()
+            pillar_positions = self._generate_pillar_layout(difficulty)
+            self.env_pillar_layouts.append(pillar_positions)
+            
+            for pillar_idx, (pillar_type, pos) in enumerate(pillar_positions):
+                # Choose dimensions based on type
+                if pillar_type == 'start' or pillar_type == 'end':
+                    length, width, height = 1.0, 1.0, 1.0
+                else:
+                    length, width, height = 0.25, 1.0, 1.0
+                
+                # Create box vertices with environment offset
+                x, y, z = pos[0] + env_origin[0], pos[1] + env_origin[1], pos[2]
+                box_vertices = [
+                    [x - length/2, y - width/2, z - height/2],
+                    [x + length/2, y - width/2, z - height/2],
+                    [x + length/2, y + width/2, z - height/2],
+                    [x - length/2, y + width/2, z - height/2],
+                    [x - length/2, y - width/2, z + height/2],
+                    [x + length/2, y - width/2, z + height/2],
+                    [x + length/2, y + width/2, z + height/2],
+                    [x - length/2, y + width/2, z + height/2],
+                ]
+                vertices.extend(box_vertices)
+                
+                base = vertex_count
+                box_faces = [
+                    [base+0, base+2, base+1], [base+0, base+3, base+2],
+                    [base+4, base+5, base+6], [base+4, base+6, base+7],
+                    [base+0, base+1, base+5], [base+0, base+5, base+4],
+                    [base+2, base+7, base+6], [base+2, base+3, base+7],
+                    [base+0, base+4, base+7], [base+0, base+7, base+3],
+                    [base+1, base+2, base+6], [base+1, base+6, base+5],
+                ]
+                faces.extend(box_faces)
+                vertex_count += 8
+        
+        # Add all pillars as one triangle mesh
+        if vertices and faces:
+            import numpy as np
+            vertices_np = np.array(vertices, dtype=np.float32)
+            faces_np = np.array(faces, dtype=np.uint32)
+            
+            tm_params = gymapi.TriangleMeshParams()
+            tm_params.nb_vertices = len(vertices)
+            tm_params.nb_triangles = len(faces)
+            tm_params.static_friction = 0.8
+            tm_params.dynamic_friction = 0.8
+            tm_params.restitution = 0.1
+            
+            self.gym.add_triangle_mesh(self.sim, vertices_np.flatten(), faces_np.flatten(), tm_params)
+        
+        # Record corners for first environment (for visualization)
+        self._update_pillar_corners(0)
+        
+        print(f"✅ Bridge created for {self.num_envs} environments with curriculum!")
+    
+    def _update_pillar_corners(self, env_id):
+        """ Update pillar corners for given environment """
+        if env_id >= len(self.env_pillar_layouts):
+            return
+        
+        self.pillar_top_corners = []
+        env_origin = self.env_origins[env_id].cpu().numpy()
+        
+        for pillar_type, pos in self.env_pillar_layouts[env_id]:
+            if pillar_type == 'start' or pillar_type == 'end':
+                length, width, height = 1.0, 1.0, 1.0
+            else:
+                length, width, height = 0.25, 1.0, 1.0
+            
+            x, y, z = pos[0] + env_origin[0], pos[1] + env_origin[1], pos[2]
+            top_corners = [
+                [x - length/2, y - width/2, z + height/2],
+                [x + length/2, y - width/2, z + height/2],
+                [x + length/2, y + width/2, z + height/2],
+                [x - length/2, y + width/2, z + height/2],
+            ]
+            self.pillar_top_corners.append({
+                'type': pillar_type,
+                'center': [x, y, z],
+                'corners': top_corners
+            })
 
     def _get_env_origins(self):
         """ Sets environment origins. On rough terrain the origins are defined by the terrain platforms.
@@ -738,25 +908,73 @@ class SiriusJoyFlat(BaseTask):
         self.cfg.domain_rand.push_interval = np.ceil(self.cfg.domain_rand.push_interval_s / self.dt)
 
     def _draw_debug_vis(self):
-        """ Draws visualizations for dubugging (slows down simulation a lot).
-            Default behaviour: draws height measurement points
-        """
-        # draw height lines
-        if not self.terrain.cfg.measure_heights:
+        """ Draw debug visualization (optimized for performance) """
+        if not self.viewer or not hasattr(self, 'env_pillar_layouts'):
             return
+        
         self.gym.clear_lines(self.viewer)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
-        for i in range(self.num_envs):
-            base_pos = (self.root_states[i, :3]).cpu().numpy()
-            heights = self.measured_heights[i].cpu().numpy()
-            height_points = quat_apply_yaw(self.base_quat[i].repeat(heights.shape[0]), self.height_points[i]).cpu().numpy()
-            for j in range(heights.shape[0]):
-                x = height_points[j, 0] + base_pos[0]
-                y = height_points[j, 1] + base_pos[1]
-                z = heights[j]
-                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
-                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+        
+        # Limit visualization to reduce overhead
+        max_vis_envs = min(20, self.num_envs)  # Only first 20 envs
+        
+        for env_id in range(max_vis_envs):
+            robot_pos = self.root_states[env_id, :3].cpu().numpy()
+            env_origin = self.env_origins[env_id].cpu().numpy()
+            
+            # Draw robot center marker
+            center = gymapi.Vec3(robot_pos[0], robot_pos[1], robot_pos[2] + 0.1)
+            size = 0.1
+            self.gym.add_lines(self.viewer, self.envs[env_id], 1,
+                             [center.x-size, center.y, center.z, center.x+size, center.y, center.z],
+                             (1, 1, 0))
+            self.gym.add_lines(self.viewer, self.envs[env_id], 1,
+                             [center.x, center.y-size, center.z, center.x, center.y+size, center.z],
+                             (1, 1, 0))
+            
+            # Draw visible pillar corners for this environment
+            robot_x = robot_pos[0]
+            pillar_layout = self.env_pillar_layouts[env_id]
+            
+            visible_count = 0
+            for pillar_type, pos in pillar_layout:
+                pillar_world_x = pos[0] + env_origin[0]
+                
+                # Calculate front edge
+                if pillar_type in ['start', 'end']:
+                    length = 1.0
+                else:
+                    length = 0.25
+                pillar_front_edge = pillar_world_x - length / 2
+                
+                # Check visibility
+                if robot_x < pillar_front_edge and visible_count < 2:
+                    x = pillar_world_x
+                    y = pos[1] + env_origin[1]
+                    z = pos[2]
+                    width, height = 1.0, 1.0
+                    
+                    corners = [
+                        [x - length/2, y - width/2, z + height/2],
+                        [x + length/2, y - width/2, z + height/2],
+                        [x + length/2, y + width/2, z + height/2],
+                        [x - length/2, y + width/2, z + height/2],
+                    ]
+                    
+                    color = (0, 1, 0) if visible_count == 0 else (0, 0.5, 1)
+                    for corner in corners:
+                        corner_pos = gymapi.Vec3(corner[0], corner[1], corner[2])
+                        s = 0.05
+                        self.gym.add_lines(self.viewer, self.envs[env_id], 1,
+                                         [corner_pos.x-s, corner_pos.y, corner_pos.z,
+                                          corner_pos.x+s, corner_pos.y, corner_pos.z], color)
+                        self.gym.add_lines(self.viewer, self.envs[env_id], 1,
+                                         [corner_pos.x, corner_pos.y-s, corner_pos.z,
+                                          corner_pos.x, corner_pos.y+s, corner_pos.z], color)
+                        self.gym.add_lines(self.viewer, self.envs[env_id], 1,
+                                         [corner_pos.x, corner_pos.y, corner_pos.z-s,
+                                          corner_pos.x, corner_pos.y, corner_pos.z+s], color)
+                    
+                    visible_count += 1 
 
     def _init_height_points(self):
         """ Returns points at which the height measurments are sampled (in base frame)
@@ -908,3 +1126,67 @@ class SiriusJoyFlat(BaseTask):
     def _reward_posture(self):
         weight = torch.tensor([1.0, 1.0, 0.1] * 4, device=self.device).unsqueeze(0) # shape: (1, num_dof)
         return torch.exp(-torch.sum(torch.square(self.dof_pos - self.default_dof_pos) * weight, dim=1))
+    
+    def _reward_lateral_deviation(self):
+        """ Penalize deviation from centerline (y=0) """
+        return torch.square(self.root_states[:, 1])  # y position
+    
+    def _reward_forward_progress(self):
+        """ Reward forward movement in x direction """
+        return self.base_lin_vel[:, 0]  # x velocity
+    
+    def _get_front_pillar_corners(self):
+        """ Get the top corners of pillars ahead of robot in robot base frame (optimized)
+        Returns:
+            torch.Tensor: shape (num_envs, 16) - 8 corners * 2 coordinates (x, z) in robot base frame
+        """
+        if not hasattr(self, 'env_pillar_layouts'):
+            return torch.zeros(self.num_envs, 16, device=self.device)
+        
+        corners_data = torch.zeros(self.num_envs, 16, device=self.device)
+        
+        # Batch process to reduce Python loop overhead
+        robot_pos = self.root_states[:, :3]
+        robot_quat = self.base_quat
+        
+        for env_id in range(self.num_envs):
+            robot_x = robot_pos[env_id, 0].item()
+            env_origin_x = self.env_origins[env_id, 0].item()
+            env_origin_y = self.env_origins[env_id, 1].item()
+            
+            pillar_layout = self.env_pillar_layouts[env_id]
+            
+            # Find first 2 visible pillars (early exit)
+            corner_idx = 0
+            for pillar_type, pos in pillar_layout:
+                if corner_idx >= 8:
+                    break
+                    
+                pillar_world_x = pos[0] + env_origin_x
+                length = 1.0 if pillar_type in ['start', 'end'] else 0.25
+                
+                if robot_x < pillar_world_x - length / 2:
+                    x = pillar_world_x
+                    y = pos[1] + env_origin_y
+                    z = pos[2]
+                    
+                    # Pre-compute corners
+                    half_l, half_w, half_h = length/2, 0.5, 0.5
+                    corners_world = torch.tensor([
+                        [x - half_l, y - half_w, z + half_h],
+                        [x + half_l, y - half_w, z + half_h],
+                        [x + half_l, y + half_w, z + half_h],
+                        [x - half_l, y + half_w, z + half_h],
+                    ], device=self.device, dtype=torch.float)
+                    
+                    # Batch transform all 4 corners at once
+                    corners_relative = corners_world - robot_pos[env_id]
+                    corners_robot = quat_rotate_inverse(robot_quat[env_id].unsqueeze(0).expand(4, -1), corners_relative)
+                    
+                    # Store x, z coordinates
+                    for i in range(4):
+                        corners_data[env_id, corner_idx * 2] = corners_robot[i, 0]
+                        corners_data[env_id, corner_idx * 2 + 1] = corners_robot[i, 2]
+                        corner_idx += 1
+        
+        return corners_data

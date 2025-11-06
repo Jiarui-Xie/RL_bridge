@@ -32,16 +32,19 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobot
 
 class SiriusFlatCfg( LeggedRobotCfg ):
     class env( LeggedRobotCfg.env ):
-        num_envs = 4096
+        num_envs = 100  # Will be overridden by args
         num_actions = 12
-        num_observations = 45
+        num_observations = 61
+        env_spacing = 7.0  # 7m spacing to avoid collisions
 
     class terrain( LeggedRobotCfg.terrain ):
-        mesh_type = 'plane'
+        mesh_type = 'bridge'
         measure_heights = False
+        curriculum = True
+        pillar_gap_range = [0.05, 0.15]  # Start easy (5cm), max hard (30cm)
 
     class init_state( LeggedRobotCfg.init_state ):
-        pos = [0.0, 0.0, 0.445] # x,y,z [m]
+        pos = [0.0, 0.0, 1.445] # x,y,z [m] - spawn on top of start pillar
         default_joint_angles = { # = target angles [rad] when action = 0.0
             "LF_HAA": 0.0,
             "LH_HAA": 0.0,
@@ -83,7 +86,9 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         heading_command = False
         resampling_time = 4.
         class ranges( LeggedRobotCfg.commands.ranges ):
-            ang_vel_yaw = [-1.5, 1.5]
+            lin_vel_x = [0.5, 0.5]# Only forward
+            lin_vel_y = [0.0, 0.0]  # No lateral movement
+            ang_vel_yaw = [0.0, 0.0]  # No rotation
 
     class domain_rand( LeggedRobotCfg.domain_rand):
         randomize_base_mass = True
@@ -91,17 +96,19 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         friction_range = [0., 1.5] # on ground planes the friction combination mode is averaging, i.e total friction = (foot_friction + 1.)/2.
   
     class rewards( LeggedRobotCfg.rewards ):
-        base_height_target = 0.445
+        base_height_target = 1.445
         max_contact_force = 350
         only_positive_rewards = True
         soft_dof_vel_limit = 0.8
         class scales( LeggedRobotCfg.rewards.scales ):
-            tracking_lin_vel = 1.0
+            tracking_lin_vel = 0.3
             tracking_ang_vel = 0.5
             orientation = -5.0
             feet_air_time = 3.
             base_height = -200.
             posture = 1.0
+            lateral_deviation = -10.0
+            forward_progress = 2.0
             # dof_vel = -0.005
             # dof_vel_limits = -0.1
     
