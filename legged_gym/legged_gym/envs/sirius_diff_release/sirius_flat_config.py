@@ -86,7 +86,7 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         heading_command = False
         resampling_time = 4.
         class ranges( LeggedRobotCfg.commands.ranges ):
-            lin_vel_x = [0.5, 0.5]# Only forward
+            lin_vel_x = [0.2, 0.2]  # Slower, more controlled forward movement
             lin_vel_y = [0.0, 0.0]  # No lateral movement
             ang_vel_yaw = [0.0, 0.0]  # No rotation
 
@@ -98,17 +98,19 @@ class SiriusFlatCfg( LeggedRobotCfg ):
     class rewards( LeggedRobotCfg.rewards ):
         base_height_target = 1.445
         max_contact_force = 350
-        only_positive_rewards = True
+        only_positive_rewards = False  # Allow negative rewards for proper learning
         soft_dof_vel_limit = 0.8
         class scales( LeggedRobotCfg.rewards.scales ):
-            tracking_lin_vel = 0.3
+            tracking_lin_vel = 1.0
             tracking_ang_vel = 0.5
-            orientation = -5.0
-            feet_air_time = 3.
-            base_height = -200.
-            posture = 1.0
-            lateral_deviation = -10.0
-            forward_progress = 2.0
+            orientation = -2.0  # Reduced penalty
+            feet_air_time = 1.0
+            base_height = -5.0  # Much reduced penalty
+            posture = 0.5
+            lateral_deviation = -2.0  # Reduced penalty (now fixed)
+            forward_progress = 5.0  # Increased reward for progress
+            goal_reached = 1000.0  # Huge reward for reaching the end
+            heading_alignment = -3.0  # Penalize yaw deviation from forward
             # dof_vel = -0.005
             # dof_vel_limits = -0.1
     

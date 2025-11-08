@@ -142,6 +142,11 @@ class SiriusJoyFlat(BaseTask):
         """
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
         self.reset_buf |= self.root_states[:, 2] < 1.0  # Terminate if height < 1m
+        
+        # Check for successful completion (reached end pillar)
+        self.success_buf = self._check_goal_reached()
+        self.reset_buf |= self.success_buf
+        
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
 
@@ -536,6 +541,7 @@ class SiriusJoyFlat(BaseTask):
         self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
         self.projected_gravity = torch.zeros_like(self.gravity_vec)
+        self.success_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         if self.cfg.terrain.measure_heights:
             self.height_points = self._init_height_points()
         self.measured_heights = 0
@@ -634,6 +640,30 @@ class SiriusJoyFlat(BaseTask):
         # End pillar
         final_gap = round(np.random.uniform(min_gap, gap_range), 3)
         current_x += final_gap
+        end_pos = [round(current_x + 0.5, 3), 0.0, 0.5]
+        pillar_positions.append(('end', end_pos))
+        
+        return pillar_positions
+    
+    def _generate_fixed_gap_layout(self, gap_size):
+        """ Generate pillar layout with fixed gap size for testing """
+        pillar_positions = []
+        
+        # Start pillar
+        start_pos = [0.0, 0.0, 0.5]
+        pillar_positions.append(('start', start_pos))
+        
+        current_x = 0.5
+        
+        # Middle pillars with fixed gaps
+        for i in range(10):
+            current_x += gap_size
+            middle_pos = [round(current_x + 0.125, 3), 0.0, 0.5]
+            pillar_positions.append(('middle', middle_pos))
+            current_x += 0.25
+        
+        # End pillar
+        current_x += gap_size
         end_pos = [round(current_x + 0.5, 3), 0.0, 0.5]
         pillar_positions.append(('end', end_pos))
         
@@ -781,11 +811,24 @@ class SiriusJoyFlat(BaseTask):
         # Store pillar layouts for each environment
         self.env_pillar_layouts = []
         
+        # Check if we're in test mode (small num_envs typically means testing)
+        test_mode = self.num_envs <= 10
+        
         # Create pillars for each environment
         for env_id in range(self.num_envs):
             env_origin = self.env_origins[env_id].cpu().numpy()
-            difficulty = self.pillar_difficulty[env_id].item()
-            pillar_positions = self._generate_pillar_layout(difficulty)
+            
+            if test_mode:
+                # Test mode: randomly choose 5cm or 15cm for each environment
+                import random
+                gap_size = random.choice([0.05, 0.15])
+                pillar_positions = self._generate_fixed_gap_layout(gap_size)
+                print(f"  Test Env {env_id}: Gap = {gap_size*100:.0f}cm")
+            else:
+                # Training mode: use curriculum
+                difficulty = self.pillar_difficulty[env_id].item()
+                pillar_positions = self._generate_pillar_layout(difficulty)
+            
             self.env_pillar_layouts.append(pillar_positions)
             
             for pillar_idx, (pillar_type, pos) in enumerate(pillar_positions):
@@ -839,7 +882,10 @@ class SiriusJoyFlat(BaseTask):
         # Record corners for first environment (for visualization)
         self._update_pillar_corners(0)
         
-        print(f"✅ Bridge created for {self.num_envs} environments with curriculum!")
+        if test_mode:
+            print(f"✅ Test bridge created with random 5cm/15cm gaps!")
+        else:
+            print(f"✅ Bridge created for {self.num_envs} environments with curriculum!")
     
     def _update_pillar_corners(self, env_id):
         """ Update pillar corners for given environment """
@@ -1129,11 +1175,66 @@ class SiriusJoyFlat(BaseTask):
     
     def _reward_lateral_deviation(self):
         """ Penalize deviation from centerline (y=0) """
-        return torch.square(self.root_states[:, 1])  # y position
+        # Clip y deviation to reasonable range and normalize
+        y_deviation = torch.clip(self.root_states[:, 1], -2.0, 2.0)  # Limit to ±2m
+        return torch.square(y_deviation / 2.0)  # Normalize to [0, 1] range
     
     def _reward_forward_progress(self):
         """ Reward forward movement in x direction """
         return self.base_lin_vel[:, 0]  # x velocity
+    
+    def _reward_heading_alignment(self):
+        """ Penalize deviation from forward heading (yaw should be 0) """
+        # Get yaw angle from quaternion
+        forward = quat_apply(self.base_quat, self.forward_vec)
+        yaw = torch.atan2(forward[:, 1], forward[:, 0])
+        # Penalize deviation from 0 yaw (forward direction)
+        return torch.square(yaw)
+    
+    def _reward_goal_reached(self):
+        """ Reward for reaching end pillar, with bonus for smooth landing """
+        base_reward = self.success_buf.float() * 50.0  # Base success reward
+        
+        # Add velocity penalty for successful robots
+        if torch.any(self.success_buf):
+            # Calculate total velocity magnitude for successful robots
+            total_vel = torch.norm(self.base_lin_vel, dim=1) + torch.norm(self.base_ang_vel, dim=1)
+            # Smooth landing bonus: lower velocity = higher bonus (increased importance)
+            smooth_bonus = torch.exp(-total_vel * 2.0) * 100.0  # Max 100 bonus for very smooth landing
+            # Only apply bonus to successful robots
+            smooth_bonus = smooth_bonus * self.success_buf.float()
+            return base_reward + smooth_bonus
+        
+        return base_reward
+    
+    def _check_goal_reached(self):
+        """ Check if robot reached the end pillar """
+        if not hasattr(self, 'env_pillar_layouts'):
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        for env_id in range(self.num_envs):
+            robot_pos = self.root_states[env_id, :3]
+            env_origin = self.env_origins[env_id]
+            
+            # Find end pillar position
+            pillar_layout = self.env_pillar_layouts[env_id]
+            for pillar_type, pos in pillar_layout:
+                if pillar_type == 'end':
+                    # End pillar world position
+                    end_x = pos[0] + env_origin[0].item()
+                    end_y = pos[1] + env_origin[1].item()
+                    
+                    # Check if robot is within end pillar bounds (1m x 1m)
+                    x_in_bounds = (robot_pos[0] >= end_x - 0.5) and (robot_pos[0] <= end_x + 0.5)
+                    y_in_bounds = (robot_pos[1] >= end_y - 0.5) and (robot_pos[1] <= end_y + 0.5)
+                    height_ok = robot_pos[2] > 1.0  # Above ground
+                    
+                    success[env_id] = x_in_bounds and y_in_bounds and height_ok
+                    break
+        
+        return success
     
     def _get_front_pillar_corners(self):
         """ Get the top corners of pillars ahead of robot in robot base frame (optimized)
