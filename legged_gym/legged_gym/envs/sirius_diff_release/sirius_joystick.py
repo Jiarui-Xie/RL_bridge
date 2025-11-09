@@ -411,13 +411,10 @@ class SiriusJoyFlat(BaseTask):
             env_ids (List[int]): Environemnt ids
         """
         # base position
-        if self.custom_origins:
-            self.root_states[env_ids] = self.base_init_state
-            self.root_states[env_ids, :3] += self.env_origins[env_ids]
-            self.root_states[env_ids, :2] += torch_rand_float(-1., 1., (len(env_ids), 2), device=self.device) # xy position within 1m of the center
-        else:
-            self.root_states[env_ids] = self.base_init_state
-            self.root_states[env_ids, :3] += self.env_origins[env_ids]
+        self.root_states[env_ids] = self.base_init_state
+        self.root_states[env_ids, :3] += self.env_origins[env_ids]
+        # Add random offset in xy direction (±0.1m)
+        self.root_states[env_ids, :2] += torch_rand_float(-0.1, 0.1, (len(env_ids), 2), device=self.device)
         # base velocities
         self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6), device=self.device) # [7:10]: lin vel, [10:13]: ang vel
         env_ids_int32 = env_ids.to(dtype=torch.int32)
@@ -1174,10 +1171,11 @@ class SiriusJoyFlat(BaseTask):
         return torch.exp(-torch.sum(torch.square(self.dof_pos - self.default_dof_pos) * weight, dim=1))
     
     def _reward_lateral_deviation(self):
-        """ Penalize deviation from centerline (y=0) """
-        # Clip y deviation to reasonable range and normalize
-        y_deviation = torch.clip(self.root_states[:, 1], -2.0, 2.0)  # Limit to ±2m
-        return torch.square(y_deviation / 2.0)  # Normalize to [0, 1] range
+        """ Penalize deviation from centerline (y=0 relative to env origin) """
+        # Calculate y position relative to environment origin
+        y_relative = self.root_states[:, 1] - self.env_origins[:, 1]
+        # Penalize deviation from centerline (y=0)
+        return torch.square(y_relative)
     
     def _reward_forward_progress(self):
         """ Reward forward movement in x direction """
@@ -1190,6 +1188,16 @@ class SiriusJoyFlat(BaseTask):
         yaw = torch.atan2(forward[:, 1], forward[:, 0])
         # Penalize deviation from 0 yaw (forward direction)
         return torch.square(yaw)
+    
+    def _reward_knee_contact(self):
+        """ Penalize running on knees (detect thigh/calf contact with ground) """
+        # Check contact forces on thigh and calf (not feet)
+        # penalised_contact_indices includes calf and thigh
+        thigh_calf_contact = torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > 1.0
+        # Sum up contacts across all penalized body parts
+        knee_penalty = torch.sum(thigh_calf_contact.float(), dim=1)
+        
+        return knee_penalty
     
     def _reward_goal_reached(self):
         """ Reward for reaching end pillar, with bonus for smooth landing """
@@ -1227,7 +1235,7 @@ class SiriusJoyFlat(BaseTask):
                     end_y = pos[1] + env_origin[1].item()
                     
                     # Check if robot is within end pillar bounds (1m x 1m)
-                    x_in_bounds = (robot_pos[0] >= end_x - 0.5) and (robot_pos[0] <= end_x + 0.5)
+                    x_in_bounds = (robot_pos[0] >= end_x) and (robot_pos[0] <= end_x + 0.5)
                     y_in_bounds = (robot_pos[1] >= end_y - 0.5) and (robot_pos[1] <= end_y + 0.5)
                     height_ok = robot_pos[2] > 1.0  # Above ground
                     
