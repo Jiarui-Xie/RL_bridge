@@ -1159,8 +1159,11 @@ class SiriusJoyFlat(BaseTask):
              5 *torch.abs(self.contact_forces[:, self.feet_indices, 2]), dim=1)
         
     def _reward_stand_still(self):
-        # Penalize motion at zero commands
-        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (torch.norm(self.commands[:, :2], dim=1) < 0.1)
+        # Penalize standing still when should be moving forward
+        # Check if velocity is too low (< 0.1 m/s)
+        is_standing = torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.1
+        # Penalize if standing still (should always move forward in bridge task)
+        return is_standing.float()
 
     def _reward_feet_contact_forces(self):
         # penalize high contact forces
@@ -1190,14 +1193,21 @@ class SiriusJoyFlat(BaseTask):
         return torch.square(yaw)
     
     def _reward_knee_contact(self):
-        """ Penalize running on knees (detect thigh/calf contact with ground) """
-        # Check contact forces on thigh and calf (not feet)
-        # penalised_contact_indices includes calf and thigh
-        thigh_calf_contact = torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > 1.0
-        # Sum up contacts across all penalized body parts
-        knee_penalty = torch.sum(thigh_calf_contact.float(), dim=1)
+        """ Penalize any non-foot contact with ground """
+        # Get all body contact forces
+        all_contact_forces = torch.norm(self.contact_forces, dim=-1)  # (num_envs, num_bodies)
         
-        return knee_penalty
+        # Create mask: True for all bodies except feet
+        non_foot_mask = torch.ones(all_contact_forces.shape[1], dtype=torch.bool, device=self.device)
+        non_foot_mask[self.feet_indices] = False  # Exclude feet
+        
+        # Check non-foot contacts > 1.0N
+        non_foot_contact = all_contact_forces[:, non_foot_mask] > 1.0
+        
+        # Sum up all non-foot contacts
+        penalty = torch.sum(non_foot_contact.float(), dim=1)
+        
+        return penalty
     
     def _reward_goal_reached(self):
         """ Reward for reaching end pillar, with bonus for smooth landing """

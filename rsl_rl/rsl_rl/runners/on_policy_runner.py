@@ -74,6 +74,7 @@ class OnPolicyRunner:
         # Log
         self.log_dir = log_dir
         self.writer = None
+        self.wandb = None  # Will be set externally if using wandb
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
@@ -175,6 +176,35 @@ class OnPolicyRunner:
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
             self.writer.add_scalar('Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
+        
+        # Log to wandb if available
+        if self.wandb is not None:
+            wandb_log = {
+                'iteration': locs['it'],
+                'loss/value_function': locs['mean_value_loss'],
+                'loss/surrogate': locs['mean_surrogate_loss'],
+                'policy/learning_rate': self.alg.learning_rate,
+                'policy/mean_noise_std': mean_std.item(),
+                'perf/fps': fps,
+                'perf/collection_time': locs['collection_time'],
+                'perf/learning_time': locs['learn_time'],
+                'time/total_timesteps': self.tot_timesteps,
+                'time/total_time': self.tot_time,
+            }
+            if len(locs['rewbuffer']) > 0:
+                wandb_log['train/mean_reward'] = statistics.mean(locs['rewbuffer'])
+                wandb_log['train/mean_episode_length'] = statistics.mean(locs['lenbuffer'])
+            if locs['ep_infos']:
+                for key in locs['ep_infos'][0]:
+                    infotensor = torch.tensor([], device=self.device)
+                    for ep_info in locs['ep_infos']:
+                        if not isinstance(ep_info[key], torch.Tensor):
+                            ep_info[key] = torch.Tensor([ep_info[key]])
+                        if len(ep_info[key].shape) == 0:
+                            ep_info[key] = ep_info[key].unsqueeze(0)
+                        infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                    wandb_log[f'episode/{key}'] = torch.mean(infotensor).item()
+            self.wandb.log(wandb_log)
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 

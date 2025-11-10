@@ -101,18 +101,20 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         only_positive_rewards = False  # Allow negative rewards for proper learning
         soft_dof_vel_limit = 0.8
         class scales( LeggedRobotCfg.rewards.scales ):
-            tracking_lin_vel = 1.0
+            tracking_lin_vel = 2.0  # Increased: encourage forward movement
             tracking_ang_vel = 0.5
-            orientation = -2.0  # Reduced penalty
-            feet_air_time = 1.0
-            base_height = -5.0  # Much reduced penalty
-            posture = 0.5
-            lateral_deviation = -2.0  # Reduced penalty (now fixed)
-            forward_progress = 5.0  # Increased reward for progress
+            orientation = -1.0  # Reduced: less penalty for tilt
+            feet_air_time = 1.5  # Increased: encourage dynamic gait
+            base_height = -2.0  # Reduced: less penalty for height deviation
+            posture = 0.3  # Reduced: allow more flexibility
+            lateral_deviation = -1.0  # Reduced: less penalty for y deviation
+            forward_progress = 10.0  # Doubled: strong incentive to move forward
             goal_reached = 1000.0  # Huge reward for reaching the end
-            heading_alignment = -3.0  # Penalize yaw deviation from forward
-            knee_contact = -10.0  # Penalize knee contact (running on knees)
-            # dof_vel = -0.005
+            heading_alignment = -1.0  # Reduced: less penalty for yaw
+            knee_contact = -5.0  # Reduced: less harsh penalty
+            action_rate = -0.01  # Small penalty for action changes
+            dof_vel = -0.001  # Small penalty for joint velocity
+            stand_still = -2.0  # Penalize standing still when should move
             # dof_vel_limits = -0.1
     
     class noise( LeggedRobotCfg.noise ):

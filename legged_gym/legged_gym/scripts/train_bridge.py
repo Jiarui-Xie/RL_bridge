@@ -17,6 +17,13 @@ from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
 import torch
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("⚠️  wandb not installed. Install with: pip install wandb")
+
 def find_latest_model():
     """Find the latest model in logs directory"""
     logs_dir = 'logs'
@@ -38,6 +45,20 @@ def main():
     
     args = get_args()
     args.task = 'sirius'
+    
+    # Initialize wandb
+    use_wandb = WANDB_AVAILABLE and not hasattr(args, 'no_wandb')
+    if use_wandb:
+        wandb.init(
+            project="sirius-bridge-crossing",
+            name=f"bridge_{datetime.now().strftime('%m%d_%H%M')}",
+            config={
+                "task": args.task,
+                "num_envs": args.num_envs if hasattr(args, 'num_envs') else 4096,
+                "headless": args.headless if hasattr(args, 'headless') else True,
+            }
+        )
+        print("✅ WandB initialized")
     
     # Handle load_run parameter (model path)
     if hasattr(args, 'load_run') and args.load_run:
@@ -77,12 +98,31 @@ def main():
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
     
+    # Update wandb config with full settings
+    if use_wandb:
+        try:
+            wandb.config.update({
+                "max_iterations": train_cfg.runner.max_iterations,
+                "num_steps_per_env": train_cfg.runner.num_steps_per_env,
+                "learning_rate": train_cfg.algorithm.learning_rate,
+            })
+        except:
+            pass  # Skip if config access fails
+    
+    # Pass wandb to runner
+    if use_wandb:
+        ppo_runner.wandb = wandb
+    
     # Load model if specified
     if hasattr(args, 'load_run') and args.load_run:
         ppo_runner.load(args.load_run)
         print(f"✅ Loaded model from: {args.load_run}")
     
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    try:
+        ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    finally:
+        if use_wandb:
+            wandb.finish()
 
 if __name__ == '__main__':
     main()
