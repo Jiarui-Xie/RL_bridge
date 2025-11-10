@@ -1181,8 +1181,11 @@ class SiriusJoyFlat(BaseTask):
         return torch.square(y_relative)
     
     def _reward_forward_progress(self):
-        """ Reward forward movement in x direction """
-        return self.base_lin_vel[:, 0]  # x velocity
+        """ Reward total forward distance from start """
+        # Calculate distance from environment origin (start position)
+        distance = self.root_states[:, 0] - self.env_origins[:, 0]
+        # Normalize to reasonable range (0-5m)
+        return torch.clip(distance / 5.0, 0.0, 1.0)
     
     def _reward_heading_alignment(self):
         """ Penalize deviation from forward heading (yaw should be 0) """
