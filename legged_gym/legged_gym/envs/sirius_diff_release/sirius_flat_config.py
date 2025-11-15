@@ -34,13 +34,13 @@ class SiriusFlatCfg( LeggedRobotCfg ):
     class env( LeggedRobotCfg.env ):
         num_envs = 100  # Will be overridden by args
         num_actions = 12
-        num_observations = 61
+        num_observations = 64  # Updated: added base_lin_vel (3 dims)
         env_spacing = 7.0  # 7m spacing to avoid collisions
 
     class terrain( LeggedRobotCfg.terrain ):
         mesh_type = 'bridge'
         measure_heights = False
-        curriculum = True
+        curriculum = False
         pillar_gap_range = [0.05, 0.15]  # Start easy (5cm), max hard (30cm)
 
     class init_state( LeggedRobotCfg.init_state ):
@@ -86,35 +86,39 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         heading_command = False
         resampling_time = 4.
         class ranges( LeggedRobotCfg.commands.ranges ):
-            lin_vel_x = [0.15, 0.15]  # Slow, controlled forward movement for short gaps
+            lin_vel_x = [0.25, 0.25]  # Slow, controlled forward movement for short gaps
             lin_vel_y = [0.0, 0.0]  # No lateral movement
             ang_vel_yaw = [0.0, 0.0]  # No rotation
 
     class domain_rand( LeggedRobotCfg.domain_rand):
-        randomize_base_mass = True
-        added_mass_range = [-5., 5.]
+        # Disable large base-mass randomization during debugging / early training to
+        # avoid cases where very heavy robots learn to drag instead of stepping.
+        randomize_base_mass = False
+        # If re-enabled later, prefer a much smaller added mass range to reduce extremes
+        added_mass_range = [-1., 1.]
         friction_range = [0., 1.5] # on ground planes the friction combination mode is averaging, i.e total friction = (foot_friction + 1.)/2.
   
     class rewards( LeggedRobotCfg.rewards ):
-        base_height_target = 1.445
+        base_height_target = 1.4
         max_contact_force = 350
         only_positive_rewards = False  # Allow negative rewards for proper learning
         soft_dof_vel_limit = 0.8
         class scales( LeggedRobotCfg.rewards.scales ):
-            tracking_lin_vel = 2.0  # Track target velocity (0.15 m/s)
+            tracking_lin_vel = 5.0  # PRIMARY: track target velocity (reduced to avoid dragging shortcut)
             tracking_ang_vel = 0.5
-            orientation = -1.0  # Reduced: less penalty for tilt
-            feet_air_time = 1.5  # Increased: encourage dynamic gait
-            base_height = -2.0  # Reduced: less penalty for height deviation
-            posture = 0.3  # Reduced: allow more flexibility
-            lateral_deviation = -1.0  # Reduced: less penalty for y deviation
-            forward_progress = 5.0  # Reward distance traveled forward
-            goal_reached = 1000.0  # Huge reward for reaching the end
-            heading_alignment = -1.0  # Reduced: less penalty for yaw
-            knee_contact = -5.0  # Reduced: less harsh penalty
-            action_rate = -0.01  # Small penalty for action changes
-            dof_vel = -0.001  # Small penalty for joint velocity
-            stand_still = -2.0  # Penalize standing still when should move
+            orientation = -1.0
+            feet_air_time = 0.8
+            base_height = -2.0
+            posture = 0.3
+            lateral_deviation = -1.0
+            forward_progress = 0.1  # Disabled: conflicts with velocity tracking
+            goal_reached = 20.0  # Reduced: don't rush to goal ignoring velocity
+            heading_alignment = -1.0
+            knee_contact = -2.0
+            foot_in_gap = -0.5  # penalty for foot entering pillar gap (z < 1.0)
+            action_rate = -0.01
+            dof_vel = -0.001
+            stand_still = -0.3  # Penalize standing still
             # dof_vel_limits = -0.1
     
     class noise( LeggedRobotCfg.noise ):
@@ -122,7 +126,7 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         noise_level = 1.0 # scales other values
         class noise_scales( LeggedRobotCfg.noise.noise_scales ):
             dof_pos = 0.03
-            dof_vel = 1.5
+            dof_vel = 0.4  # Reduced from 1.5 to improve learning signal
             lin_vel = 0.1
             ang_vel = 0.5
             gravity = 0.05
@@ -141,4 +145,4 @@ class SiriusFlatCfgPPO( LeggedRobotCfgPPO ):
         run_name = ''
         experiment_name = "sirius_diff_release"
         load_run = -1
-        max_iterations = 1200
+        max_iterations = 2000  # Increased from 1200 for better convergence

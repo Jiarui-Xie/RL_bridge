@@ -111,6 +111,11 @@ class SiriusJoyFlat(BaseTask):
         """
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
+        # refresh rigid body state tensor so foot world positions are up-to-date
+        try:
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
+        except Exception:
+            pass
 
         self.episode_length_buf += 1
         self.common_step_counter += 1
@@ -140,13 +145,22 @@ class SiriusJoyFlat(BaseTask):
     def check_termination(self):
         """ Check if environments need to be reset
         """
+        # Failure conditions: collision or height too low
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
         self.reset_buf |= self.root_states[:, 2] < 1.0  # Terminate if height < 1m
-        
+
         # Check for successful completion (reached end pillar)
+        # Do not immediately reset on success; instead start a 1s timer and reset after that
         self.success_buf = self._check_goal_reached()
-        self.reset_buf |= self.success_buf
-        
+
+        # update per-env success elapsed timer: accumulate dt while success is True
+        self.success_elapsed = torch.where(self.success_buf, self.success_elapsed + self.dt, torch.zeros_like(self.success_elapsed))
+
+        # reset environments that have been successful for >= 1.0s
+        success_reset = self.success_elapsed >= 1.0
+        self.reset_buf |= success_reset
+
+        # time-out conditions
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
 
@@ -179,6 +193,9 @@ class SiriusJoyFlat(BaseTask):
         self.last_actions[env_ids] = 0.
         self.last_dof_vel[env_ids] = 0.
         self.feet_air_time[env_ids] = 0.
+        # reset success elapsed timer used for delayed reset after reaching goal
+        if hasattr(self, 'success_elapsed'):
+            self.success_elapsed[env_ids] = 0.
         self.episode_length_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
         # fill extras
@@ -220,7 +237,8 @@ class SiriusJoyFlat(BaseTask):
         # Get front two pillars' top corners (8 corners total, 16 values: x,z coordinates)
         pillar_corners = self._get_front_pillar_corners()  # shape: (num_envs, 16)
         
-        self.obs_buf = torch.cat((  self.base_ang_vel  * self.obs_scales.ang_vel, # 3dim
+        self.obs_buf = torch.cat((  self.base_lin_vel * self.obs_scales.lin_vel, # 3dim (xy + z)
+                                    self.base_ang_vel  * self.obs_scales.ang_vel, # 3dim
                                     self.projected_gravity, # 3dim
                                     self.commands[:, :3] * self.commands_scale, # 3dim
                                     (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos, # 12dim
@@ -361,9 +379,6 @@ class SiriusJoyFlat(BaseTask):
         else:
             self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
 
-        # set small commands to zero
-        self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
-
     def _compute_torques(self, actions):
         """ Compute torques from actions.
             Actions can be interpreted as position or velocity targets given to a PD controller, or directly as scaled torques.
@@ -438,9 +453,9 @@ class SiriusJoyFlat(BaseTask):
         distance = self.root_states[env_ids, 0] - self.env_origins[env_ids, 0]
         
         # Increase difficulty if robot traveled > 2m
-        move_up = distance > 2.0
+        move_up = distance > 3.5
         # Decrease difficulty if robot failed quickly (< 1m)
-        move_down = (distance < 1.0) * ~move_up
+        move_down = (distance < 0.4) * ~move_up
         
         # Update difficulty (0.0 to 1.0)
         self.pillar_difficulty[env_ids] += 0.1 * move_up.float() - 0.05 * move_down.float()
@@ -471,6 +486,16 @@ class SiriusJoyFlat(BaseTask):
     def _get_noise_scale_vec(self, cfg):
         """ Sets a vector used to scale the noise added to the observations.
             [NOTE]: Must be adapted when changing the observations structure
+            
+            NEW observation order (64 dims total):
+            0:3     - base_lin_vel (3)
+            3:6     - base_ang_vel (3)
+            6:9     - projected_gravity (3)
+            9:12    - commands (3)
+            12:24   - dof_pos (12)
+            24:36   - dof_vel (12)
+            36:48   - actions (12)
+            48:64   - pillar_corners (16)
 
         Args:
             cfg (Dict): Environment config file
@@ -482,14 +507,14 @@ class SiriusJoyFlat(BaseTask):
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
         noise_level = self.cfg.noise.noise_level
-        # noise_vec[:3] = noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel
-        noise_vec[0:3] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-        noise_vec[3:6] = noise_scales.gravity * noise_level
-        noise_vec[6:9] = 0. # commands
-        noise_vec[9:21] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-        noise_vec[21:33] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-        noise_vec[33:45] = 0. # previous actions
-        noise_vec[45:61] = 0.05 * noise_level  # pillar corners (16 values)
+        noise_vec[0:3] = noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel
+        noise_vec[3:6] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
+        noise_vec[6:9] = noise_scales.gravity * noise_level
+        noise_vec[9:12] = 0. # commands
+        noise_vec[12:24] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+        noise_vec[24:36] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+        noise_vec[36:48] = 0. # previous actions
+        noise_vec[48:64] = 0.05 * noise_level  # pillar corners (16 values)
         if self.cfg.terrain.measure_heights:
             noise_vec[61:] = noise_scales.height_measurements* noise_level * self.obs_scales.height_measurements
         return noise_vec
@@ -502,9 +527,18 @@ class SiriusJoyFlat(BaseTask):
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
+        # acquire rigid body state tensor (used to get per-foot world positions)
+        # layout is assumed to be [num_envs * num_bodies, ...], we will view it into (num_envs, num_bodies, dim)
+        body_state_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
+        # refresh rigid body state tensor as well
+        try:
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
+        except Exception:
+            # some gym builds may not have this explicit refresh call; acquire/wrap will still work
+            pass
 
         # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
@@ -514,6 +548,14 @@ class SiriusJoyFlat(BaseTask):
         self.base_quat = self.root_states[:, 3:7]
 
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
+
+        # wrap rigid body state tensor and view as (num_envs, num_bodies, dim)
+        # common rigid body state layout is 13 values per body (pos(3), quat(4), vel(3), angvel(3))
+        try:
+            self.rigid_body_state = gymtorch.wrap_tensor(body_state_tensor).view(self.num_envs, self.num_bodies, 13)
+        except Exception:
+            # Fallback: create a placeholder tensor so code won't crash during static checks; runtime may overwrite
+            self.rigid_body_state = torch.zeros(self.num_envs, self.num_bodies, 13, device=self.device)
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -542,6 +584,9 @@ class SiriusJoyFlat(BaseTask):
         if self.cfg.terrain.measure_heights:
             self.height_points = self._init_height_points()
         self.measured_heights = 0
+
+        # per-env timer to delay reset after success (allow 1s of continued operation)
+        self.success_elapsed = torch.zeros(self.num_envs, device=self.device)
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -618,7 +663,11 @@ class SiriusJoyFlat(BaseTask):
         
         # Interpolate gap range based on difficulty
         min_gap, max_gap = self.cfg.terrain.pillar_gap_range
-        gap_range = min_gap + difficulty * (max_gap - min_gap)
+        # If curriculum disabled, use full range
+        if not self.cfg.terrain.curriculum:
+            gap_range = max_gap
+        else:
+            gap_range = min_gap + difficulty * (max_gap - min_gap)
         
         # Start pillar
         start_pos = [0.0, 0.0, 0.5]
@@ -978,6 +1027,8 @@ class SiriusJoyFlat(BaseTask):
             robot_x = robot_pos[0]
             pillar_layout = self.env_pillar_layouts[env_id]
             
+            # Use an offset reference point 0.5m ahead of the robot when checking which pillars are "in front"
+            forward_offset = 0.5
             visible_count = 0
             for pillar_type, pos in pillar_layout:
                 pillar_world_x = pos[0] + env_origin[0]
@@ -989,8 +1040,8 @@ class SiriusJoyFlat(BaseTask):
                     length = 0.25
                 pillar_front_edge = pillar_world_x - length / 2
                 
-                # Check visibility
-                if robot_x < pillar_front_edge and visible_count < 2:
+                # Check visibility relative to a point 0.5m in front of the robot
+                if (robot_x + forward_offset) < pillar_front_edge and visible_count < 2:
                     x = pillar_world_x
                     y = pos[1] + env_origin[1]
                     z = pos[2]
@@ -1141,16 +1192,41 @@ class SiriusJoyFlat(BaseTask):
         return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
 
     def _reward_feet_air_time(self):
-        # Reward long steps
-        # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
-        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
-        contact_filt = torch.logical_or(contact, self.last_contacts) 
-        self.last_contacts = contact
-        first_contact = (self.feet_air_time > 0.) * contact_filt
-        self.feet_air_time += self.dt
-        rew_airTime = torch.sum((self.feet_air_time - 0.5) * first_contact, dim=1) # reward only on first contact with the ground
-        rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1 #no reward for zero command
-        self.feet_air_time *= ~contact_filt
+        # Reward meaningful foot airtime (encourage stepping)
+        # Improvements over previous implementation:
+        # - use an explicit rising-edge detection (contact now & ~last_contacts)
+        # - only count airtime while foot is not contacting
+        # - use a smaller, realistic minimum airtime threshold (e.g. 0.15s)
+        # - use a slightly stricter contact threshold to avoid noise
+        contact_thresh = 5.0  # [N] vertical force threshold to consider contact (tune to robot)
+        min_air_time = 0.15   # [s] minimum airtime to consider a meaningful step
+
+        # detect contact now using z component
+        contact_now = self.contact_forces[:, self.feet_indices, 2] > contact_thresh
+
+        # rising edge: foot was not in contact previously, and now it is
+        contact_rising = contact_now & (~self.last_contacts)
+
+        # first_contact: foot had some airtime and we see a rising edge
+        first_contact = (self.feet_air_time > 0.) & contact_rising
+
+        # accumulate airtime while foot is in the air (not contacting)
+        self.feet_air_time += self.dt * (~contact_now).float()
+
+        # reward = sum over feet of (airtime - min_air_time) but only for those that just contacted
+        effective_air = (self.feet_air_time - min_air_time).clip(min=0.)
+        rew_airTime = torch.sum(effective_air * first_contact.float(), dim=1)
+
+        # only reward when there's a non-zero locomotion command
+        cmd_mask = (torch.norm(self.commands[:, :2], dim=1) > 0.1).float()
+        rew_airTime = rew_airTime * cmd_mask
+
+        # reset airtime for feet that are contacting (avoid double counting)
+        self.feet_air_time = self.feet_air_time * (~contact_now).float()
+
+        # update last_contacts for next step
+        self.last_contacts = contact_now
+
         return rew_airTime
     
     def _reward_stumble(self):
@@ -1169,6 +1245,24 @@ class SiriusJoyFlat(BaseTask):
         # penalize high contact forces
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
     
+    def _reward_foot_in_gap(self):
+        """Penalize feet that are below the safe height (e.g., z < 1.0).
+        Uses rigid body state to get exact foot world z positions.
+        Returns a positive penalty per env (to be multiplied by a negative scale in cfg).
+        """
+        try:
+            # body state layout: [..., pos_x, pos_y, pos_z, quat_w, ...] assumed; pos indices 0:3
+            foot_positions_z = self.rigid_body_state[:, self.feet_indices, 2]
+        except Exception:
+            # If rigid body state not available, no penalty
+            return torch.zeros(self.num_envs, device=self.device)
+
+        # penalty is how much below threshold the foot is (sum over feet)
+        thresh = 1.0
+        below = (thresh - foot_positions_z).clip(min=0.)
+        penalty = torch.sum(below, dim=1)
+        return penalty
+    
     def _reward_posture(self):
         weight = torch.tensor([1.0, 1.0, 0.1] * 4, device=self.device).unsqueeze(0) # shape: (1, num_dof)
         return torch.exp(-torch.sum(torch.square(self.dof_pos - self.default_dof_pos) * weight, dim=1))
@@ -1181,11 +1275,38 @@ class SiriusJoyFlat(BaseTask):
         return torch.square(y_relative)
     
     def _reward_forward_progress(self):
-        """ Reward total forward distance from start """
+        """ Reward forward distance with one-time milestone bonuses at 1m, 2m, 3m, etc.
+        Uses persistent state to track which milestones have been reached to prevent
+        repeated rewards from oscillation around milestone positions.
+        """
+        # Initialize milestone tracker if not exists
+        if not hasattr(self, 'milestone_reached'):
+            self.milestone_reached = torch.zeros(self.num_envs, 5, dtype=torch.bool, device=self.device)
+        
         # Calculate distance from environment origin (start position)
         distance = self.root_states[:, 0] - self.env_origins[:, 0]
-        # Normalize to reasonable range (0-5m)
-        return torch.clip(distance / 5.0, 0.0, 1.0)
+        
+        # Continuous progress reward (small baseline)
+        continuous_reward = torch.clip(distance / 10.0, 0.0, 1.0)
+        
+        # Milestone bonuses: one-time trigger when distance first exceeds threshold
+        milestones = torch.zeros(self.num_envs, device=self.device)
+        milestone_distances = [1.0, 2.0, 3.0, 4.0, 5.0]
+        
+        for idx, m in enumerate(milestone_distances):
+            # Check if milestone is newly reached (distance > threshold AND not yet recorded)
+            newly_reached = (distance >= m) & (~self.milestone_reached[:, idx])
+            
+            # Award bonus and mark as reached
+            milestones += newly_reached.float() * 0.2  # One-time 0.2 bonus
+            self.milestone_reached[:, idx] |= newly_reached
+        
+        # Reset milestone tracker for environments that reset
+        reset_envs = self.reset_buf.nonzero(as_tuple=False).flatten()
+        if len(reset_envs) > 0:
+            self.milestone_reached[reset_envs] = False
+        
+        return continuous_reward + milestones
     
     def _reward_heading_alignment(self):
         """ Penalize deviation from forward heading (yaw should be 0) """
@@ -1213,23 +1334,18 @@ class SiriusJoyFlat(BaseTask):
         return penalty
     
     def _reward_goal_reached(self):
-        """ Reward for reaching end pillar, with bonus for smooth landing """
-        base_reward = self.success_buf.float() * 50.0  # Base success reward
-        
-        # Add velocity penalty for successful robots
-        if torch.any(self.success_buf):
-            # Calculate total velocity magnitude for successful robots
-            total_vel = torch.norm(self.base_lin_vel, dim=1) + torch.norm(self.base_ang_vel, dim=1)
-            # Smooth landing bonus: lower velocity = higher bonus (increased importance)
-            smooth_bonus = torch.exp(-total_vel * 2.0) * 100.0  # Max 100 bonus for very smooth landing
-            # Only apply bonus to successful robots
-            smooth_bonus = smooth_bonus * self.success_buf.float()
-            return base_reward + smooth_bonus
-        
-        return base_reward
+        """ Reward for reaching end pillar (no velocity penalty at goal).
+        机器狗成功到达终点柱子即给奖励，不要求零速度到达（否则会强制减速导致散架）。
+        """
+        # Simple success reward: reaching the end pillar = fixed bonus
+        # 不添加速度相关的惩罚或奖励，让机器狗可以正常速度冲过终点
+        return self.success_buf.float() * 1.0  # Fixed 1.0 reward for reaching goal
     
     def _check_goal_reached(self):
-        """ Check if robot reached the end pillar """
+        """ Check if robot reached the end pillar.
+        条件：机器人的 x 坐标必须超过终点柱子的中心 x 坐标（而不是仅进入柱子范围）。
+        这样避免在进入柱子时立刻散架，确保机器狗真正"穿过"了终点。
+        """
         if not hasattr(self, 'env_pillar_layouts'):
             return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
@@ -1243,22 +1359,26 @@ class SiriusJoyFlat(BaseTask):
             pillar_layout = self.env_pillar_layouts[env_id]
             for pillar_type, pos in pillar_layout:
                 if pillar_type == 'end':
-                    # End pillar world position
+                    # End pillar world position (center)
                     end_x = pos[0] + env_origin[0].item()
                     end_y = pos[1] + env_origin[1].item()
                     
-                    # Check if robot is within end pillar bounds (1m x 1m)
-                    x_in_bounds = (robot_pos[0] >= end_x) and (robot_pos[0] <= end_x + 0.5)
-                    y_in_bounds = (robot_pos[1] >= end_y - 0.5) and (robot_pos[1] <= end_y + 0.5)
+                    # Success condition: robot x position MUST EXCEED end pillar center x
+                    # This ensures the robot truly "passes through" the goal
+                    x_passed = robot_pos[0] > end_x  # Must be beyond center, not just inside
+                    y_in_bounds = (robot_pos[1] >= end_y - 0.6) and (robot_pos[1] <= end_y + 0.6)
                     height_ok = robot_pos[2] > 1.0  # Above ground
                     
-                    success[env_id] = x_in_bounds and y_in_bounds and height_ok
+                    success[env_id] = x_passed and y_in_bounds and height_ok
                     break
         
         return success
     
     def _get_front_pillar_corners(self):
         """ Get the top corners of pillars ahead of robot in robot base frame (optimized)
+        Uses a 0.5m forward offset for visibility check (determining which pillars to report),
+        but returns corner coordinates relative to robot position (without offset).
+        
         Returns:
             torch.Tensor: shape (num_envs, 16) - 8 corners * 2 coordinates (x, z) in robot base frame
         """
@@ -1270,6 +1390,8 @@ class SiriusJoyFlat(BaseTask):
         # Batch process to reduce Python loop overhead
         robot_pos = self.root_states[:, :3]
         robot_quat = self.base_quat
+        # Offset (m) in front of robot used ONLY for visibility check (which pillars are "in front")
+        forward_offset = 0.5
         
         for env_id in range(self.num_envs):
             robot_x = robot_pos[env_id, 0].item()
@@ -1287,7 +1409,8 @@ class SiriusJoyFlat(BaseTask):
                 pillar_world_x = pos[0] + env_origin_x
                 length = 1.0 if pillar_type in ['start', 'end'] else 0.25
                 
-                if robot_x < pillar_world_x - length / 2:
+                # Use forward_offset for visibility check: pillar is "in front" if ahead of robot+0.5m reference
+                if (robot_x + forward_offset) < pillar_world_x - length / 2:
                     x = pillar_world_x
                     y = pos[1] + env_origin_y
                     z = pos[2]
@@ -1301,11 +1424,11 @@ class SiriusJoyFlat(BaseTask):
                         [x - half_l, y + half_w, z + half_h],
                     ], device=self.device, dtype=torch.float)
                     
-                    # Batch transform all 4 corners at once
+                    # Transform corners to robot frame using robot position (NO offset in coordinate transformation)
                     corners_relative = corners_world - robot_pos[env_id]
                     corners_robot = quat_rotate_inverse(robot_quat[env_id].unsqueeze(0).expand(4, -1), corners_relative)
                     
-                    # Store x, z coordinates
+                    # Store x, z coordinates (relative to robot, no bias)
                     for i in range(4):
                         corners_data[env_id, corner_idx * 2] = corners_robot[i, 0]
                         corners_data[env_id, corner_idx * 2 + 1] = corners_robot[i, 2]
