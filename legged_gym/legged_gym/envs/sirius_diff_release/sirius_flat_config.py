@@ -44,43 +44,41 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         pillar_gap_range = [0.05, 0.15]  # Start easy (5cm), max hard (30cm)
 
     class init_state( LeggedRobotCfg.init_state ):
-        pos = [0.0, 0.0, 1.445] # x,y,z [m] - spawn on top of start pillar
+        pos = [0.0, 0.0, 1.42] # x,y,z [m] - spawn on top of start pillar
         default_joint_angles = { # = target angles [rad] when action = 0.0
-            "LF_HAA": 0.0,
-            "LH_HAA": 0.0,
-            "RF_HAA": 0.0,
-            "RH_HAA": 0.0,
+            'FL_hip_joint': 0.1,
+            'RL_hip_joint': 0.1,
+            'FR_hip_joint': -0.1,
+            'RR_hip_joint': -0.1,
 
-            "LF_HFE": 0.8,
-            "LH_HFE": -0.8,
-            "RF_HFE": 0.8,
-            "RH_HFE": -0.8,
+            'FL_thigh_joint': 0.8,
+            'RL_thigh_joint': 1.0,
+            'FR_thigh_joint': 0.8,
+            'RR_thigh_joint': 1.0,
 
-            "LF_KFE": -1.6,
-            "LH_KFE": 1.6,
-            "RF_KFE": -1.6,
-            "RH_KFE": 1.6,
+            'FL_calf_joint': -1.5,
+            'RL_calf_joint': -1.5,
+            'FR_calf_joint': -1.5,
+            'RR_calf_joint': -1.5,
         }
             
     class control( LeggedRobotCfg.control ):
         # PD Drive parameters:
-        stiffness = {'HAA': 40., 'HFE': 40., 'KFE': 40.}  # [N*m/rad]
-        damping = {'HAA': 2., 'HFE': 2., 'KFE': 2.}     # [N*m*s/rad]
+        control_type = 'P'
+        stiffness = {'joint': 30.}  # [N*m/rad]
+        damping = {'joint': 0.6}     # [N*m*s/rad]
         # action scale: target angle = actionScale * action + defaultAngle
-        action_scale = 0.5
+        action_scale = 0.25
         # decimation: Number of control action updates @ sim DT per policy DT
-        decimation = 5
-        use_actuator_network = False #True
-        # actuator_net_file = "{LEGGED_GYM_ROOT_DIR}/resources/actuator_nets/anydrive_v3_lstm.pt"
+        decimation = 4
 
     class asset( LeggedRobotCfg.asset ):
-        file = "{LEGGED_GYM_ROOT_DIR}/resources/robots/sirius_diff_release/urdf/sirius_diff_new.urdf"
-        name = "sirius"
-        foot_name = "FOOT"
-        penalize_contacts_on = ["calf", "thigh"]
+        file = "{LEGGED_GYM_ROOT_DIR}/resources/robots/go1/urdf/go1.urdf"
+        name = "go1"
+        foot_name = "calf"  # Go1's feet are the calf links
+        penalize_contacts_on = ["thigh"]
         terminate_after_contacts_on = ["base"]
         self_collisions = 1 #1 to disable, 0 to enable...bitwise filter
-        flip_visual_attachments = False
 
     class commands( LeggedRobotCfg.commands ):
         heading_command = False
@@ -99,7 +97,7 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         friction_range = [0., 1.5] # on ground planes the friction combination mode is averaging, i.e total friction = (foot_friction + 1.)/2.
   
     class rewards( LeggedRobotCfg.rewards ):
-        base_height_target = 1.4
+        base_height_target = 1.35
         max_contact_force = 350
         only_positive_rewards = False  # Allow negative rewards for proper learning
         soft_dof_vel_limit = 0.8

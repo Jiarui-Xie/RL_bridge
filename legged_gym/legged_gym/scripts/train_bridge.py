@@ -50,7 +50,7 @@ def main():
     use_wandb = WANDB_AVAILABLE and not hasattr(args, 'no_wandb')
     if use_wandb:
         wandb.init(
-            project="sirius-bridge-crossing",
+            project="go1-bridge-crossing",
             name=f"bridge_{datetime.now().strftime('%m%d_%H%M')}",
             config={
                 "task": args.task,
