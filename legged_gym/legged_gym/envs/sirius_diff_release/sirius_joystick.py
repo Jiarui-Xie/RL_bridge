@@ -146,8 +146,8 @@ class SiriusJoyFlat(BaseTask):
         """ Check if environments need to be reset
         """
         # Failure conditions: collision or height too low
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
-        self.reset_buf |= self.root_states[:, 2] < 1.0  # Terminate if height < 1m
+        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 0.1, dim=1)
+        self.reset_buf |= self.root_states[:, 2] < 1.1  # Terminate if height < 1.15m
 
         # Check for successful completion (reached end pillar)
         # Do not immediately reset on success; instead start a 1s timer and reset after that
@@ -234,7 +234,7 @@ class SiriusJoyFlat(BaseTask):
     def compute_observations(self):
         """ Computes observations
         """
-        # Get front two pillars' top corners (8 corners total, 16 values: x,z coordinates)
+        # Get front two pillars' top corners (8 corners total, 16 values: x, y coordinates)
         pillar_corners = self._get_front_pillar_corners()  # shape: (num_envs, 16)
         
         self.obs_buf = torch.cat((  self.base_lin_vel * self.obs_scales.lin_vel, # 3dim (xy + z)
@@ -1138,9 +1138,9 @@ class SiriusJoyFlat(BaseTask):
         return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
 
     def _reward_base_height(self):
-        # Penalize base height away from target
+        # Penalize base height away from target (using absolute difference)
         base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
-        return torch.square(base_height - self.cfg.rewards.base_height_target)
+        return torch.abs(base_height - self.cfg.rewards.base_height_target)
     
     def _reward_torques(self):
         # Penalize torques
@@ -1192,42 +1192,53 @@ class SiriusJoyFlat(BaseTask):
         return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
 
     def _reward_feet_air_time(self):
-        # Reward meaningful foot airtime (encourage stepping)
-        # Improvements over previous implementation:
-        # - use an explicit rising-edge detection (contact now & ~last_contacts)
-        # - only count airtime while foot is not contacting
-        # - use a smaller, realistic minimum airtime threshold (e.g. 0.15s)
-        # - use a slightly stricter contact threshold to avoid noise
-        contact_thresh = 5.0  # [N] vertical force threshold to consider contact (tune to robot)
-        min_air_time = 0.15   # [s] minimum airtime to consider a meaningful step
+        """奖励有效步幅，而不是单纯的腾空时间"""
+        contact_thresh = 1.0
+        min_air_time = self.cfg.rewards.min_air_time
+        max_air_time = self.cfg.rewards.max_air_time
 
-        # detect contact now using z component
+        # 检测接触状态
         contact_now = self.contact_forces[:, self.feet_indices, 2] > contact_thresh
-
-        # rising edge: foot was not in contact previously, and now it is
-        contact_rising = contact_now & (~self.last_contacts)
-
-        # first_contact: foot had some airtime and we see a rising edge
-        first_contact = (self.feet_air_time > 0.) & contact_rising
-
-        # accumulate airtime while foot is in the air (not contacting)
-        self.feet_air_time += self.dt * (~contact_now).float()
-
-        # reward = sum over feet of (airtime - min_air_time) but only for those that just contacted
-        effective_air = (self.feet_air_time - min_air_time).clip(min=0.)
-        rew_airTime = torch.sum(effective_air * first_contact.float(), dim=1)
-
-        # only reward when there's a non-zero locomotion command
-        cmd_mask = (torch.norm(self.commands[:, :2], dim=1) > 0.1).float()
-        rew_airTime = rew_airTime * cmd_mask
-
-        # reset airtime for feet that are contacting (avoid double counting)
-        self.feet_air_time = self.feet_air_time * (~contact_now).float()
-
-        # update last_contacts for next step
+        contact_filt = torch.logical_or(contact_now, self.last_contacts)
+        
+        # 记录腾空开始时的足端位置
+        if not hasattr(self, 'foot_liftoff_pos'):
+            self.foot_liftoff_pos = torch.zeros(self.num_envs, len(self.feet_indices), 3, device=self.device)
+        
+        # 检测刚离地的脚
+        just_lifted = (~contact_filt) & self.last_contacts
+        if just_lifted.any():
+            foot_positions = self.rigid_body_state[:, self.feet_indices, :3]
+            self.foot_liftoff_pos[just_lifted] = foot_positions[just_lifted]
+        
+        # 检测刚落地的脚
+        first_contact = (self.feet_air_time > 0.) * contact_filt
         self.last_contacts = contact_now
-
-        return rew_airTime
+        self.feet_air_time += self.dt
+        
+        # 计算步幅（只看xy平面位移）
+        foot_positions = self.rigid_body_state[:, self.feet_indices, :3]
+        stride_length = torch.norm(
+            foot_positions[:, :, :2] - self.foot_liftoff_pos[:, :, :2], 
+            dim=2
+        )
+        
+        # 有效步态条件：合理腾空时间 + 最小步幅
+        valid_air_time = (self.feet_air_time >= min_air_time) & (self.feet_air_time <= max_air_time)
+        min_stride = 0.10  # 最小步幅10cm，强制正常步态
+        valid_stride = stride_length > min_stride
+        
+        # 奖励 = 步幅 × 腾空时间（双重验证有效步态）
+        rew_stride = torch.sum(
+            stride_length * self.feet_air_time * first_contact * valid_air_time * valid_stride,
+            dim=1
+        )
+        
+        # 只在有速度命令时给奖励
+        rew_stride *= torch.norm(self.commands[:, :2], dim=1) > 0.1
+        
+        self.feet_air_time *= ~contact_filt
+        return rew_stride
     
     def _reward_stumble(self):
         # Penalize feet hitting vertical surfaces
@@ -1246,22 +1257,24 @@ class SiriusJoyFlat(BaseTask):
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
     
     def _reward_foot_in_gap(self):
-        """Penalize feet that are below the safe height (e.g., z < 1.0).
-        Uses rigid body state to get exact foot world z positions.
+        """惩罚脚低于1m：固定惩罚0.5 + 向下速度惩罚
+        Uses rigid body state to get exact foot world z positions and velocities.
         Returns a positive penalty per env (to be multiplied by a negative scale in cfg).
         """
-        try:
-            # body state layout: [..., pos_x, pos_y, pos_z, quat_w, ...] assumed; pos indices 0:3
-            foot_positions_z = self.rigid_body_state[:, self.feet_indices, 2]
-        except Exception:
-            # If rigid body state not available, no penalty
-            return torch.zeros(self.num_envs, device=self.device)
-
-        # penalty is how much below threshold the foot is (sum over feet)
+        # body state layout: [pos(3), quat(4), vel(3), angvel(3)] = 13 values
+        foot_positions_z = self.rigid_body_state[:, self.feet_indices, 2]  # z position
+        foot_velocities_z = self.rigid_body_state[:, self.feet_indices, 9]  # z velocity (index 6+3=9)
         thresh = 1.0
-        below = (thresh - foot_positions_z).clip(min=0.)
-        penalty = torch.sum(below, dim=1)
-        return penalty
+        below_thresh = foot_positions_z < thresh  # Boolean mask
+        
+        # Fixed penalty: 0.5 per foot below threshold
+        fixed_penalty = torch.sum(below_thresh.float() * 0.5, dim=1)
+        
+        # Velocity penalty: penalize downward velocity (negative z velocity) when below threshold
+        downward_vel = torch.abs(foot_velocities_z.clip(max=0.))  # Only negative velocities
+        velocity_penalty = torch.sum(below_thresh.float() * downward_vel, dim=1)
+        
+        return fixed_penalty + velocity_penalty
     
     def _reward_posture(self):
         weight = torch.tensor([1.0, 1.0, 0.1] * 4, device=self.device).unsqueeze(0) # shape: (1, num_dof)
@@ -1333,6 +1346,26 @@ class SiriusJoyFlat(BaseTask):
         
         return penalty
     
+    def _reward_hip_motion(self):
+        """惩罚hip关节角度超出[0, 0.2]rad范围
+        Go1关节顺序：每条腿 [hip, thigh, calf]
+        索引：FL(0,1,2), FR(3,4,5), RL(6,7,8), RR(9,10,11)
+        """
+        hip_indices = [0, 3, 6, 9]  # 4个hip关节
+        hip_angles = torch.abs(self.dof_pos[:, hip_indices])  # 取绝对值，因为左右腿符号相反
+        # 只惩罚超出[0, 0.2]范围的部分
+        violation = (hip_angles - 0.2).clip(min=0.)
+        return torch.sum(violation, dim=1)
+    
+    def _reward_gait_symmetry(self):
+        # 鼓励对称步态
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+        # 前左-后右对角线
+        diag1 = torch.abs(contact[:, 0].float() - contact[:, 3].float())
+        # 前右-后左对角线  
+        diag2 = torch.abs(contact[:, 1].float() - contact[:, 2].float())
+        return -(diag1 + diag2)  # 负号表示惩罚不对称
+    
     def _reward_goal_reached(self):
         """ Reward for reaching end pillar (no velocity penalty at goal).
         机器狗成功到达终点柱子即给奖励，不要求零速度到达（否则会强制减速导致散架）。
@@ -1391,7 +1424,7 @@ class SiriusJoyFlat(BaseTask):
         robot_pos = self.root_states[:, :3]
         robot_quat = self.base_quat
         # Offset (m) in front of robot used ONLY for visibility check (which pillars are "in front")
-        forward_offset = 0.5
+        forward_offset = 0.4
         
         for env_id in range(self.num_envs):
             robot_x = robot_pos[env_id, 0].item()
@@ -1428,10 +1461,10 @@ class SiriusJoyFlat(BaseTask):
                     corners_relative = corners_world - robot_pos[env_id]
                     corners_robot = quat_rotate_inverse(robot_quat[env_id].unsqueeze(0).expand(4, -1), corners_relative)
                     
-                    # Store x, z coordinates (relative to robot, no bias)
+                    # Store x, y coordinates (relative to robot, no bias)
                     for i in range(4):
                         corners_data[env_id, corner_idx * 2] = corners_robot[i, 0]
-                        corners_data[env_id, corner_idx * 2 + 1] = corners_robot[i, 2]
+                        corners_data[env_id, corner_idx * 2 + 1] = corners_robot[i, 1]
                         corner_idx += 1
         
         return corners_data

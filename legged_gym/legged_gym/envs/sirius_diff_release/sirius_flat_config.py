@@ -44,31 +44,39 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         pillar_gap_range = [0.05, 0.15]  # Start easy (5cm), max hard (30cm)
 
     class init_state( LeggedRobotCfg.init_state ):
-        pos = [0.0, 0.0, 1.42] # x,y,z [m] - spawn on top of start pillar
+        pos = [0.0, 0.0, 1.40] # x,y,z [m] - spawn on top of start pillar
         default_joint_angles = { # = target angles [rad] when action = 0.0
             'FL_hip_joint': 0.1,
             'RL_hip_joint': 0.1,
             'FR_hip_joint': -0.1,
             'RR_hip_joint': -0.1,
 
-            'FL_thigh_joint': 0.8,
-            'RL_thigh_joint': 1.0,
-            'FR_thigh_joint': 0.8,
-            'RR_thigh_joint': 1.0,
+            'FL_thigh_joint': 0.9,  # 略微增加以提高重心
+            'RL_thigh_joint': 1.1,  # 后腿更弯曲以提供更好的推进力
+            'FR_thigh_joint': 0.9,
+            'RR_thigh_joint': 1.1,
 
-            'FL_calf_joint': -1.5,
-            'RL_calf_joint': -1.5,
-            'FR_calf_joint': -1.5,
-            'RR_calf_joint': -1.5,
+            'FL_calf_joint': -1.6,  # 略微增加弯曲
+            'RL_calf_joint': -1.6,
+            'FR_calf_joint': -1.6,
+            'RR_calf_joint': -1.6,
         }
             
     class control( LeggedRobotCfg.control ):
-        # PD Drive parameters:
+        # PD Drive parameters: 使用官方Go1参数
         control_type = 'P'
-        stiffness = {'joint': 30.}  # [N*m/rad]
-        damping = {'joint': 0.6}     # [N*m*s/rad]
+        stiffness = {
+            'hip': 100.0,    # Hip joints: p=100, d=5
+            'thigh': 300.0,  # Thigh joints: p=300, d=8  
+            'calf': 300.0    # Calf joints: p=300, d=8
+        }
+        damping = {
+            'hip': 5.0,
+            'thigh': 8.0,
+            'calf': 8.0
+        }
         # action scale: target angle = actionScale * action + defaultAngle
-        action_scale = 0.25
+        action_scale = 0.4
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 4
 
@@ -84,7 +92,7 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         heading_command = False
         resampling_time = 4.
         class ranges( LeggedRobotCfg.commands.ranges ):
-            lin_vel_x = [0.25, 0.25]  # Slow, controlled forward movement for short gaps
+            lin_vel_x = [0.3, 0.3]  # Slow, controlled forward movement for short gaps
             lin_vel_y = [0.0, 0.0]  # No lateral movement
             ang_vel_yaw = [0.0, 0.0]  # No rotation
 
@@ -93,38 +101,46 @@ class SiriusFlatCfg( LeggedRobotCfg ):
         # avoid cases where very heavy robots learn to drag instead of stepping.
         randomize_base_mass = False
         # If re-enabled later, prefer a much smaller added mass range to reduce extremes
-        added_mass_range = [-1., 1.]
+        added_mass_range = [-2., 2.]
         friction_range = [0., 1.5] # on ground planes the friction combination mode is averaging, i.e total friction = (foot_friction + 1.)/2.
   
     class rewards( LeggedRobotCfg.rewards ):
         base_height_target = 1.35
         max_contact_force = 350
         only_positive_rewards = False  # Allow negative rewards for proper learning
-        soft_dof_vel_limit = 0.8
+        soft_dof_vel_limit = 1.0
+        # 步态相关参数
+        min_air_time = 0.7  # 降低最小腾空时间，允许更自然的步态
+        max_air_time = 1.2   # 最大腾空时间
         class scales( LeggedRobotCfg.rewards.scales ):
-            tracking_lin_vel = 5.0  # PRIMARY: track target velocity (reduced to avoid dragging shortcut)
+            tracking_lin_vel = 6.0  # PRIMARY: track target velocity
             tracking_ang_vel = 0.5
-            orientation = -1.0
-            feet_air_time = 0.8
-            base_height = -2.0
-            posture = 0.3
+            ang_vel_xy = -0.02  # 降低pitch/roll角速度惩罚，允许自然晃动
+            orientation = -1.0  # 大幅加强姿态约束，防止爬行
+            feet_air_time = 2.0  # 大幅提高步态奖励，鼓励正常步幅
+            base_height = -3.0  # 大幅加强高度约束，防止趴下
+            posture = 0.8  # 适度提高姿态约束
             lateral_deviation = -1.0
-            forward_progress = 0.1  # Disabled: conflicts with velocity tracking
-            goal_reached = 20.0  # Reduced: don't rush to goal ignoring velocity
+            forward_progress = 0.1
+            goal_reached = 10.0
             heading_alignment = -1.0
-            knee_contact = -2.0
-            foot_in_gap = -0.5  # penalty for foot entering pillar gap (z < 1.0)
-            action_rate = -0.01
-            dof_vel = -0.001
-            stand_still = -0.3  # Penalize standing still
-            # dof_vel_limits = -0.1
+            knee_contact = -3.0  # 大幅加强，严禁膝盖接触地面
+            foot_in_gap = -2.0  # 加强，防止脚落入缝隙
+            action_rate = -0.04  # 大幅提高，惩罚高频动作变化
+            dof_vel = -0.0004  # 提高5倍，惩罚快速关节运动
+            dof_acc = -2.5e-7  # 提高，平滑动作
+            stand_still = -0.5
+            feet_contact_forces = -0.01
+            stumble = -0.5
+            hip_motion = -1.0  # 惩罚hip角度超出[0, 0.2]rad范围
+            termination = 0
     
     class noise( LeggedRobotCfg.noise ):
         add_noise = True
         noise_level = 1.0 # scales other values
         class noise_scales( LeggedRobotCfg.noise.noise_scales ):
             dof_pos = 0.03
-            dof_vel = 0.4  # Reduced from 1.5 to improve learning signal
+            dof_vel = 0.7  # Reduced from 1.5 to improve learning signal
             lin_vel = 0.1
             ang_vel = 0.5
             gravity = 0.05
@@ -138,6 +154,9 @@ class SiriusFlatCfgPPO( LeggedRobotCfgPPO ):
         actor_hidden_dims = [128, 64, 32]
         critic_hidden_dims = [128, 64, 32]
         activation = 'elu' # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
+
+    class algorithm( LeggedRobotCfgPPO.algorithm ):
+        learning_rate = 1.e-3  # 增大学习率从 1e-3 到 3e-3
 
     class runner( LeggedRobotCfgPPO.runner ):
         run_name = ''
