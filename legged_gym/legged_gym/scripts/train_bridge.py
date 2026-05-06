@@ -64,7 +64,7 @@ def main():
     if hasattr(args, 'load_run') and args.load_run:
         print(f"🔄 Loading from: {args.load_run}")
     else:
-        print("🎆 Starting fresh training")
+        print("Starting fresh training")
     
     # Set num_envs based on headless mode
     if args.headless:
@@ -77,15 +77,14 @@ def main():
         env_count = "100 parallel environments"
     
     print("="*60)
-    print(f"Sirius Pillar Training - {mode} MODE")
-    print("🎆 TRAINING")
+    print(f"Sirius Bridge Training - {mode} MODE")
     print("="*60)
-    print("Features:")
-    print("  🏗️  立柱环境 = 起始立柱 + 10个中间立柱 + 终点立柱")
-    print(f"  🤖 {env_count}")
-    print("  📏 随机间距 = 5-15cm")
-    print("  🎯 目标 = 从起始立柱跳到终点立柱")
-    print("  📐 环境间距 = 7m (避免碰撞)")
+    print("Environment:")
+    print("  Start platform + 10 stepping pillars (0.25 m wide) + end platform")
+    print(f"  {env_count}")
+    print("  Gap range: 5-15 cm (randomized per pillar)")
+    print("  Goal: walk from start platform to end platform")
+    print("  Env spacing: 7 m (prevents cross-environment collisions)")
     print("="*60)
     if not args.headless:
         print("Press 'V' to toggle viewer sync")

@@ -68,9 +68,7 @@ class SiriusJoyFlat(BaseTask):
         self.debug_viz = True
         self.init_done = False
         self._parse_cfg(self.cfg)
-        print(f"DEBUG: cfg.env.num_envs = {cfg.env.num_envs}")
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
-        print(f"DEBUG: After super().__init__, self.num_envs = {self.num_envs}")
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
@@ -807,7 +805,7 @@ class SiriusJoyFlat(BaseTask):
         env_upper = gymapi.Vec3(0., 0., 0.)
         self.actor_handles = []
         self.envs = []
-        print(f"DEBUG: Creating {self.num_envs} environments...")
+        print(f"Creating {self.num_envs} environments...")
         for i in range(self.num_envs):
             # create env instance
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
